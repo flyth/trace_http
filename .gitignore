@@ -1,0 +1,10 @@
+# Build output
+*.o
+*.wasm
+*.tar.gz
+/ig
+
+# Editor / OS
+.DS_Store
+*.swp
+/.idea/

@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+
+# Don't let rapid pushes to the same branch/tag race on the same image tag.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Version of the ig CLI used to build the gadget. Bump to upgrade.
+  # NOTE: this gadget needs sk_skb/sock_ops support in ig; pin a version that has it.
+  IG_VERSION: v0.53.2
+
+jobs:
+  build-and-push:
+    name: Build and push to ghcr.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install ig
+        run: |
+          set -eux
+          curl -sSL -o ig.tar.gz \
+            "https://github.com/inspektor-gadget/inspektor-gadget/releases/download/${IG_VERSION}/ig-linux-amd64-${IG_VERSION}.tar.gz"
+          sudo tar -C /usr/local/bin -xzf ig.tar.gz ig
+          rm -f ig.tar.gz
+          ig version
+
+      - name: Determine image and tags
+        id: meta
+        run: |
+          set -eux
+          # ghcr.io requires a lowercase repository path. Derive the image name
+          # from the repo itself so nothing is hardcoded; renaming the GitHub
+          # repo automatically renames the published image.
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            # Version tag: publish <version> and move latest.
+            tags="${GITHUB_REF#refs/tags/} latest"
+          elif [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            tags="latest"
+          else
+            # Any other branch: publish a single branch-named tag (no latest), so
+            # you can `ig run <image>:<branch>`. Branch names are sanitized into a
+            # valid OCI tag (e.g. feature/foo -> feature-foo).
+            branch="${GITHUB_REF#refs/heads/}"
+            tags="$(printf '%s' "${branch}" | tr '/' '-' | tr -cd 'a-zA-Z0-9._-')"
+          fi
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -eux
+          primary="$(echo "${TAGS}" | awk '{print $1}')"
+          sudo ig image build -t "${IMAGE}:${primary}" .
+
+          # ghcr.io returns HTTP 500 on the FIRST push of a gadget manifest
+          # (it carries an OCI artifactType) when the package does not exist
+          # yet. That failed request still creates the package, so a retry
+          # succeeds. Established packages push first time.
+          push_with_retry() {
+            local ref="$1" i
+            for i in 1 2 3 4 5; do
+              if sudo -E ig image push "${ref}"; then
+                return 0
+              fi
+              echo "push of ${ref} failed (attempt ${i}); retrying in $((i * 5))s..."
+              sleep $((i * 5))
+            done
+            echo "push of ${ref} failed after retries"
+            return 1
+          }
+
+          for t in ${TAGS}; do
+            if [ "${t}" != "${primary}" ]; then
+              sudo ig image tag "${IMAGE}:${primary}" "${IMAGE}:${t}"
+            fi
+            push_with_retry "${IMAGE}:${t}"
+          done

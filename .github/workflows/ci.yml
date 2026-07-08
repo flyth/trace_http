@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  # Version of the ig CLI used to build and run the gadget. Bump to upgrade.
+  # NOTE: this gadget needs sk_skb/sock_ops support in ig; pin a version that has it.
+  IG_VERSION: v0.53.2
+
+jobs:
+  build-and-test:
+    name: Build and smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install ig
+        run: |
+          set -eux
+          curl -sSL -o ig.tar.gz \
+            "https://github.com/inspektor-gadget/inspektor-gadget/releases/download/${IG_VERSION}/ig-linux-amd64-${IG_VERSION}.tar.gz"
+          sudo tar -C /usr/local/bin -xzf ig.tar.gz ig
+          rm -f ig.tar.gz
+          ig version
+
+      - name: Determine local image name
+        id: meta
+        run: |
+          set -eux
+          # Local build tag derived from the repo name (lowercased), so nothing
+          # is hardcoded; renaming the repo needs no change here.
+          name="${GITHUB_REPOSITORY##*/}"
+          echo "name=${name,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build gadget
+        run: sudo ig image build -t "${NAME}:ci" .
+        env:
+          NAME: ${{ steps.meta.outputs.name }}
+
+      - name: Smoke test
+        run: sudo IG=ig bash test/smoke.sh "${NAME}:ci"
+        env:
+          NAME: ${{ steps.meta.outputs.name }}

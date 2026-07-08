@@ -1,0 +1,91 @@
+name: trace http
+description: Extract HTTP/1.x requests and responses from TCP connections
+homepageURL: https://inspektor-gadget.io/
+documentationURL: https://github.com/your-org/trace_http/blob/main/README.md
+sourceURL: https://github.com/your-org/trace_http
+datasources:
+  http:
+    annotations:
+      # The raw "data" payload (headers + bounded body preview) is appended
+      # after the fixed event by the eBPF program; "data_len" gives its length.
+      ebpf.rest.name: data
+      ebpf.rest.len: data_len
+    fields:
+      src:
+        annotations:
+          description: Source (remote) endpoint of the connection
+          template: l4endpoint
+      dst:
+        annotations:
+          description: Destination (local) endpoint of the connection
+          template: l4endpoint
+      direction:
+        annotations:
+          description: Whether the message is an HTTP request or response
+          value.one-of: "request, response, unknown"
+      direction_raw:
+        annotations:
+          columns.hidden: "true"
+      pad:
+        annotations:
+          columns.hidden: "true"
+          json.skip: "true"
+      method:
+        annotations:
+          description: HTTP request method (requests only)
+          columns.width: "7"
+      path:
+        annotations:
+          description: HTTP request target/path (requests only)
+          columns.width: "32"
+          columns.alignment: left
+      http_version:
+        annotations:
+          description: HTTP protocol version, e.g. 1.1
+          columns.width: "4"
+      status_code:
+        annotations:
+          description: HTTP response status code (responses only)
+          columns.width: "6"
+      host:
+        annotations:
+          description: Value of the HTTP Host header (requests)
+          columns.width: "24"
+          columns.alignment: left
+      content_length:
+        annotations:
+          description: Value of the Content-Length header, 0 if absent
+          columns.hidden: "true"
+      is_chunked:
+        annotations:
+          description: Whether the message uses chunked transfer-encoding
+          columns.hidden: "true"
+      is_websocket:
+        annotations:
+          description: Whether the message is a websocket upgrade
+          columns.hidden: "true"
+      truncated_headers:
+        annotations:
+          description: Whether the header block was truncated by the eBPF scan window
+          columns.hidden: "true"
+      body:
+        annotations:
+          description: First bytes of the message body (up to 1024 bytes)
+          content-type: application/octet-stream
+          columns.width: "32"
+          columns.alignment: left
+      hdr_len:
+        annotations:
+          description: Length of the header block within the raw data. Internal use only.
+          columns.hidden: "true"
+          json.skip: "true"
+      data_len:
+        annotations:
+          description: Length of the raw HTTP data. Internal use only.
+          columns.hidden: "true"
+          json.skip: "true"
+      data:
+        annotations:
+          description: Raw HTTP message bytes (headers + body preview). Internal use only.
+          columns.hidden: "true"
+          json.skip: "true"

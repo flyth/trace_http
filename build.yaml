@@ -1,0 +1,4 @@
+ebpfsource: program.bpf.c
+metadata: gadget.yaml
+wasm: go/program.go
+cflags: -Werror
