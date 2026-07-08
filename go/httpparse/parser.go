@@ -33,16 +33,17 @@ const (
 
 // Message is the parsed representation of a single HTTP/1.x message.
 type Message struct {
-	Direction     string
-	Method        string
-	Path          string
-	HTTPVersion   string
-	StatusCode    uint16
-	Host          string
-	ContentLength uint32
-	IsChunked     bool
-	IsWebsocket   bool
-	Body          []byte
+	Direction        string
+	Method           string
+	Path             string
+	HTTPVersion      string
+	StatusCode       uint16
+	Host             string
+	ContentLength    uint32
+	HasContentLength bool
+	IsChunked        bool
+	IsWebsocket      bool
+	Body             []byte
 }
 
 // ParseMessage parses one bounded HTTP/1.x message. data is the raw bytes
@@ -87,6 +88,7 @@ func ParseMessage(data []byte, hdrLen int, directionRaw uint8) Message {
 		case equalFold(name, "content-length"):
 			if n, err := strconv.ParseUint(string(bytes.TrimSpace(value)), 10, 32); err == nil {
 				m.ContentLength = uint32(n)
+				m.HasContentLength = true
 			}
 		case equalFold(name, "transfer-encoding"):
 			if containsFold(value, "chunked") {

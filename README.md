@@ -1,58 +1,58 @@
 # trace_http
 
 An [Inspektor Gadget](https://inspektor-gadget.io) gadget that extracts
-**HTTP/1.x requests and responses** from TCP connections and reports them as a
-stream of structured events — method, path, status, `Host`, Content-Length and
-more — with the usual Inspektor Gadget process/container/Kubernetes enrichment.
+**HTTP/1.x request/response exchanges** from TCP connections and reports **one
+event per exchange** — method, path, status, sizes and latency — with the usual
+Inspektor Gadget process/container/Kubernetes enrichment.
 
 It observes traffic passively: connections are never modified or delayed.
 
 ## What it does
 
-For every HTTP/1.x message seen on a connection the gadget emits one event:
+For every HTTP/1.x request the gadget correlates the request with its response
+and emits a single event:
 
-| Column           | Description                                                       |
-| ---------------- | ----------------------------------------------------------------- |
-| `direction`      | `request` or `response`                                           |
-| `method`         | request method (`GET`, `POST`, …) — requests only                 |
-| `path`           | request target — requests only                                    |
-| `status_code`    | response status code — responses only                            |
-| `http_version`   | protocol version, e.g. `1.1`                                      |
-| `host`           | value of the `Host` header (requests)                             |
-| `content_length` | value of the `Content-Length` header (`0` if absent)              |
-| `is_chunked`     | whether the message uses chunked transfer-encoding                |
-| `is_websocket`   | whether the message is a WebSocket upgrade                        |
-| `body`           | the first bytes of the message body (up to 1024)                  |
-| `src`, `dst`     | source and destination L4 endpoints                               |
+| Column             | Description                                                        |
+| ------------------ | ----------------------------------------------------------------- |
+| `method`           | request method (`GET`, `POST`, …)                                 |
+| `path`             | request target                                                    |
+| `http_version`     | protocol version, e.g. `1.1`                                      |
+| `status_code`      | response status code (`0` if no response was captured)           |
+| `host`             | value of the request `Host` header                               |
+| `request_size`     | total request size in bytes (headers + body)                     |
+| `response_size`    | total response size in bytes (headers + body), `0` if unknown    |
+| `latency_ttfb_ns`  | time from request start to the first response byte (nanoseconds) |
+| `latency_total_ns` | time from request start to the last response byte (nanoseconds)  |
+| `is_chunked`       | whether the response used chunked transfer-encoding              |
+| `is_websocket`     | whether the exchange upgraded to a WebSocket                     |
+| `request_body`     | first bytes of the request body (up to 1024)                     |
+| `response_body`    | first bytes of the response body (up to 1024)                    |
+| `src`, `dst`       | client (request sender) and server (request receiver) endpoints  |
 
-Each event is also enriched with the process and container that owns the local
-end of the connection: `comm`, `pid`, `tid`, the mount and network namespaces,
-and — on Kubernetes or when using a container runtime — the container name,
-image and the pod/namespace/labels. This is the standard Inspektor Gadget
-process/container/Kubernetes enrichment.
+Each event is enriched with the process and container that owns the connection:
+`comm`, `pid`, the mount namespace, and — on Kubernetes or when using a container
+runtime — the container name and the pod/namespace/labels. This is the standard
+Inspektor Gadget process/container/Kubernetes enrichment.
 
-Requests and responses on the same connection share the connection's endpoints:
-for a request, `src` is the client and `dst` the server; for the matching
-response the two are swapped. The enrichment always reflects the **local**
-process that received the message (the server for a request, the client for a
-response).
+`src` is always the client (which sent the request) and `dst` the server.
 
 ## How it works
 
-The gadget attaches two small eBPF programs:
+The gadget attaches three small eBPF programs:
 
 - a **`sock_ops`** program on the node's cgroup-v2 root that registers every
-  established TCP socket, and
-- an **`sk_skb`** verdict program that inspects the data those sockets receive.
+  established TCP socket,
+- an **`sk_skb`** program that observes the data sockets **receive**, and
+- an **`sk_msg`** program that observes the data sockets **send**.
 
-Because it looks at *received* data on both ends of a connection, requests are
-seen as they arrive at the server and responses as they arrive at the client;
-the direction of each message is determined by reading its start line. The eBPF
-program forwards each message's headers and a short body preview to user space
-and skips the rest of the body, so the amount of data leaving the kernel stays
-proportional to the number of messages rather than to their size. A small
-WebAssembly module then turns the forwarded bytes into the structured fields
-above.
+Observing both the sent and received sides lets the gadget capture both ends of a
+connection, including connections where only one endpoint is on the node. When
+both endpoints are on the node the message is captured exactly once (no
+duplicates). The eBPF programs forward each message's headers and a short body
+preview to user space and skip the rest of the body, so the amount of data
+leaving the kernel stays proportional to the number of messages rather than to
+their size. A WebAssembly module then parses the forwarded bytes, pairs each
+request with its response, and computes the sizes and latency.
 
 The owning process and container are resolved through Inspektor Gadget's socket
 enricher, which maps each socket to the task that created it (and therefore to
@@ -61,15 +61,16 @@ its container/pod).
 ## Requirements
 
 - Linux kernel **5.17 or newer** with cgroup-v2 (a unified hierarchy mounted at
-  `/sys/fs/cgroup`) and sockmap/`sk_skb` support (enabled on stock distributions).
+  `/sys/fs/cgroup`) and sockmap/`sk_skb`/`sk_msg` support (enabled on stock
+  distributions).
 - [`ig`](https://inspektor-gadget.io/docs/latest/reference/install-linux) to run
   the gadget, and Docker to build the image.
 
-> **Note:** this gadget uses the `sk_skb` and `sock_ops` eBPF program types. Your
-> `ig` (and, on Kubernetes, the deployed Inspektor Gadget) must include support
-> for attaching these program types. If your `ig` reports an unsupported
-> program type when loading the gadget, upgrade to a build that includes it and
-> set `IG_VERSION` in `.github/workflows/*.yml` accordingly.
+> **Note:** this gadget uses the `sock_ops`, `sk_skb` and `sk_msg` eBPF program
+> types. Your `ig` (and, on Kubernetes, the deployed Inspektor Gadget) must
+> include support for attaching these program types. If your `ig` reports an
+> unsupported program type when loading the gadget, upgrade to a build that
+> includes it and set `IG_VERSION` in `.github/workflows/*.yml` accordingly.
 
 ## Getting started
 
@@ -89,16 +90,22 @@ make run              # or: sudo ig run trace_http:latest --host
 
 ```
 $ sudo ig run trace_http:latest --host
-DIRECTION   METHOD  PATH             HTTP  STATUS  HOST               SRC                DST                COMM     PID
-request     GET     /                1.1   0       127.0.0.1:8080     127.0.0.1:44274    127.0.0.1:8080     python3  1312
-response                             1.1   200                        127.0.0.1:8080     127.0.0.1:44274    curl     1373
+SRC                DST                COMM     METHOD  PATH        HTTP  STATUS  REQUEST_SIZE  RESPONSE_SIZE  LATENCY_TTFB_NS  LATENCY_TOTAL_NS
+127.0.0.1:53578    127.0.0.1:8080     curl     GET     /           1.1   200     78            161            387835           448461
+127.0.0.1:53578    127.0.0.1:8080     curl     POST    /submit     1.1   201     159           175            255168           283585
 ```
+
+### Options
+
+| Flag                     | Default | Description                                                             |
+| ------------------------ | ------- | ---------------------------------------------------------------------- |
+| `--idle-timeout-seconds` | `10`    | Emit a request-only row if its response is not seen within this time.  |
+| `--max-pending`          | `16384` | Maximum number of in-flight requests held while awaiting a response.   |
 
 ### Filtering
 
 Restrict the output with the standard Inspektor Gadget filters, which are
-matched against the process/container that owns the local end of each
-connection:
+matched against the process/container that owns the connection:
 
 ```bash
 # only a specific container / pod
@@ -116,7 +123,7 @@ Use the standard `ig` flags, for example JSON output with a chosen set of fields
 
 ```bash
 sudo ig run trace_http:latest --host \
-  --fields direction,method,path,status_code,host,src,dst,proc.comm,k8s.podName \
+  --fields method,path,status_code,request_size,response_size,latency_ttfb_ns,src,dst,k8s.podName \
   -o json
 ```
 
@@ -134,18 +141,21 @@ kubectl gadget run ghcr.io/your-org/trace_http:latest
 
 - Only **HTTP/1.x** is parsed. Connections carrying other protocols are ignored
   (they still flow normally).
-- The **`body`** column holds a preview of up to 1024 bytes. It is populated when
-  the body arrives together with the headers; a body sent in a later network
-  packet is skipped and reported only through `content_length`.
+- One event is emitted **per request/response exchange**, when the response
+  completes. A request that never receives a response is reported on its own
+  (with `status_code` `0`) once the connection closes or the idle timeout
+  elapses.
+- `request_body`/`response_body` hold a preview of up to 1024 bytes, populated
+  when the body is sent together with the headers.
+- `latency_total_ns` and `response_size` are known for responses framed by a
+  `Content-Length` or chunked transfer-encoding. For a response whose body ends
+  only when the connection closes, only `latency_ttfb_ns` is reported.
 - A **WebSocket** upgrade is reported (`is_websocket`), after which the connection
   carries WebSocket frames and is no longer parsed as HTTP.
-- The gadget sees a connection only once both of its endpoints exist on the node
-  where it runs. On a Kubernetes node this means pod-to-pod and pod-to-host
-  traffic; traffic to endpoints outside the node is seen from the local side only.
 
 ## Development
 
-Unit-test the userspace HTTP parser (no root or kernel required):
+Unit-test the userspace parser and correlation logic (no root or kernel required):
 
 ```bash
 make unit             # cd go && go test ./...

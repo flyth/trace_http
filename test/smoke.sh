@@ -2,8 +2,8 @@
 # Smoke test for the trace_http gadget.
 #
 # Hard gate: the gadget must load and attach on the current kernel (sock_ops on
-# the cgroup-v2 root, sk_skb verdict on a sockhash). Soft check: an HTTP request
-# made over loopback is captured.
+# the cgroup-v2 root, sk_skb verdict and sk_msg on a sockhash). Soft check: an
+# HTTP exchange made over loopback is captured and correlated.
 #
 # Must run as root on the same kernel ig attaches to. Usage:
 #   sudo ./test/smoke.sh [image-ref]
@@ -51,7 +51,7 @@ echo "Starting ${IMAGE}..."
 "$IG" run "$IMAGE" \
 	--verify-image=false \
 	--host \
-	--fields direction,method,path,status_code,src,dst \
+	--fields method,path,status_code,request_size,response_size,src,dst,comm \
 	-o json --timeout 12 >"$OUT" 2>"$ERR" &
 IG_PID=$!
 
@@ -81,8 +81,8 @@ if grep -qiE "^Error:|failed to (load|attach)|too large|bad address" "$ERR"; the
 	exit 1
 fi
 
-if grep -q '"direction":"request"' "$OUT" && grep -q '"method":"GET"' "$OUT"; then
-	echo "PASS: gadget loaded and captured an HTTP request"
+if grep -q '"method":"GET"' "$OUT" && grep -q '"status_code":200' "$OUT"; then
+	echo "PASS: gadget loaded and captured a correlated HTTP exchange"
 	exit 0
 fi
 
