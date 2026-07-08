@@ -426,13 +426,87 @@ static __always_inline void emit_complete(void *ctx, struct bpf_sock *bsk,
 		gadget_output_buf(ctx, &events, eb, sizeof(struct http_event));
 }
 
-// observe runs the per-stream framing state machine. buf holds the first
-// `loaded` bytes of the segment (0 if the caller decided none were needed);
-// seg_len is the full segment/message length. It updates and writes back st.
+// load_skb loads up to `len` bytes of a received segment at offset `off` into buf.
+static __always_inline __u32 load_skb(struct __sk_buff *skb, __u8 *buf,
+				      __u32 off, __u32 len)
+{
+	if (len > MAX_DATA)
+		len = MAX_DATA;
+	if (len == 0)
+		return 0;
+	if (bpf_skb_load_bytes(skb, off, buf, len) < 0)
+		return 0;
+	return len;
+}
+
+// load_msg copies up to `len` bytes of an outgoing message at offset `off` into
+// buf. sk_msg has no load-bytes helper, so pull the range linear and copy it in
+// one shot with bpf_probe_read_kernel. A per-byte loop over the packet pointer
+// explodes the verifier (per-iteration bounds tracking); a single copy stays cheap.
+static __always_inline __u32 load_msg(struct sk_msg_md *msg, __u8 *buf,
+				      __u32 off, __u32 len)
+{
+	if (len > MAX_DATA)
+		len = MAX_DATA;
+	if (len == 0)
+		return 0;
+	if (bpf_msg_pull_data(msg, off, off + len, 0) < 0)
+		return 0;
+	if (bpf_probe_read_kernel(buf, len, (const void *)(long)msg->data) < 0)
+		return 0;
+	return len;
+}
+
+static __always_inline __u32 load_at(void *ctx, bool is_skb, __u8 *buf,
+				     __u32 off, __u32 len)
+{
+	if (is_skb)
+		return load_skb((struct __sk_buff *)ctx, buf, off, len);
+	return load_msg((struct sk_msg_md *)ctx, buf, off, len);
+}
+
+// scan_terminator scans buf[0..len) for the chunked terminator "0\r\n\r\n",
+// seeding and updating the 4-byte carry in tail[] so a terminator split across
+// segments is still found. Returns true when the terminator is seen.
+static __always_inline bool scan_terminator(const __u8 *buf, __u32 len,
+					    __u8 tail[4])
+{
+	struct tscan ts = {};
+	ts.buf = buf;
+	ts.len = len > MAX_SCAN ? MAX_SCAN : len;
+	ts.t1 = tail[0];
+	ts.t2 = tail[1];
+	ts.t3 = tail[2];
+	ts.t4 = tail[3];
+	bpf_loop(ts.len, tscan_cb, &ts, 0);
+	tail[0] = ts.t1;
+	tail[1] = ts.t2;
+	tail[2] = ts.t3;
+	tail[3] = ts.t4;
+	return ts.found != 0;
+}
+
+// drain_load_scan loads the tail of the current segment (where the chunked
+// terminator lives) and scans it, updating the carry. Returns true if the
+// terminator was found. Loading the tail finds it even when the terminator is
+// far past the first MAX_SCAN bytes of a large segment.
+static __always_inline bool drain_load_scan(void *ctx, bool is_skb,
+					    struct event_buf *eb, __u32 seg_len,
+					    __u8 tail[4])
+{
+	__u32 len = seg_len > MAX_SCAN ? MAX_SCAN : seg_len;
+	__u32 off = seg_len - len;
+	__u32 loaded = load_at(ctx, is_skb, eb->data, off, len);
+	return scan_terminator(eb->data, loaded, tail);
+}
+
+// observe runs the per-stream framing state machine, loading only the bytes the
+// current phase needs. seg_len is the full segment/message length; is_skb selects
+// the load helper. It updates and writes back st.
 static __always_inline void observe(void *ctx, struct bpf_sock *bsk,
 				    __u8 cap_dir, struct state_key *skey,
 				    struct parse_state *st, struct event_buf *eb,
-				    __u32 loaded, __u32 seg_len)
+				    __u32 seg_len, bool is_skb)
 {
 	if (seg_len == 0)
 		return;
@@ -452,20 +526,9 @@ static __always_inline void observe(void *ctx, struct bpf_sock *bsk,
 	}
 
 	if (st->phase == PH_DRAIN) {
-		struct tscan ts = {};
-		ts.buf = eb->data;
-		ts.len = loaded > MAX_SCAN ? MAX_SCAN : loaded;
-		ts.t1 = st->tail[0];
-		ts.t2 = st->tail[1];
-		ts.t3 = st->tail[2];
-		ts.t4 = st->tail[3];
-		bpf_loop(ts.len, tscan_cb, &ts, 0);
-		st->tail[0] = ts.t1;
-		st->tail[1] = ts.t2;
-		st->tail[2] = ts.t3;
-		st->tail[3] = ts.t4;
+		bool done = drain_load_scan(ctx, is_skb, eb, seg_len, st->tail);
 		st->total_body += seg_len;
-		if (ts.found) {
+		if (done) {
 			st->phase = PH_HEADERS;
 			emit_complete(ctx, bsk, cap_dir, eb, st);
 		}
@@ -473,7 +536,9 @@ static __always_inline void observe(void *ctx, struct bpf_sock *bsk,
 		return;
 	}
 
-	// PH_HEADERS: this segment should start a new message.
+	// PH_HEADERS: this segment should start a new message. Load its head.
+	__u32 hlen = seg_len > MAX_DATA ? MAX_DATA : seg_len;
+	__u32 loaded = load_at(ctx, is_skb, eb->data, 0, hlen);
 	if (loaded < 4)
 		return;
 	__u8 dir = classify_start_line(eb->data);
@@ -495,9 +560,8 @@ static __always_inline void observe(void *ctx, struct bpf_sock *bsk,
 			parse_uint_at(eb->data, cl_pos, hdr_end, &has_cl);
 
 	__u32 body_in_seg = seg_len - hdr_end;
-	__u32 preview = 0;
 	__u32 body_loaded = loaded - hdr_end; // body bytes we actually have
-	preview = body_loaded > PREVIEW ? PREVIEW : body_loaded;
+	__u32 preview = body_loaded > PREVIEW ? PREVIEW : body_loaded;
 	__u32 data_len = hdr_end + preview;
 	if (data_len > MAX_DATA)
 		data_len = MAX_DATA;
@@ -535,7 +599,14 @@ static __always_inline void observe(void *ctx, struct bpf_sock *bsk,
 			emit_complete(ctx, bsk, cap_dir, eb, st);
 		}
 	} else if (is_chunked && dir == HTTP_DIR_RESPONSE) {
-		st->phase = PH_DRAIN; // frame the chunked body to its terminator
+		// The chunked body (and its terminator) may already be in this
+		// segment. Scan the segment tail before waiting for more: a
+		// response written in a single sendmsg completes right here.
+		st->phase = PH_DRAIN;
+		if (drain_load_scan(ctx, is_skb, eb, seg_len, st->tail)) {
+			st->phase = PH_HEADERS;
+			emit_complete(ctx, bsk, cap_dir, eb, st);
+		}
 	} else if (dir == HTTP_DIR_RESPONSE) {
 		// A response with neither Content-Length nor chunked ends only
 		// when the connection closes: no in-stream marker to frame by.
@@ -547,40 +618,8 @@ static __always_inline void observe(void *ctx, struct bpf_sock *bsk,
 	bpf_map_update_elem(&http_states, skey, st, BPF_ANY);
 }
 
-// load_skb loads up to MAX_DATA bytes of a received segment into buf.
-static __always_inline __u32 load_skb(struct __sk_buff *skb, __u8 *buf)
-{
-	__u32 load_len = skb->len;
-	if (load_len > MAX_DATA)
-		load_len = MAX_DATA;
-	if (load_len == 0)
-		return 0;
-	if (bpf_skb_load_bytes(skb, 0, buf, load_len) < 0)
-		return 0;
-	return load_len;
-}
-
-// load_msg copies up to MAX_DATA bytes of an outgoing message into buf. sk_msg
-// has no load-bytes helper, so pull the range linear and copy it in one shot with
-// bpf_probe_read_kernel. A per-byte loop over the packet pointer explodes the
-// verifier (per-iteration bounds tracking); a single copy stays cheap.
-static __always_inline __u32 load_msg(struct sk_msg_md *msg, __u8 *buf)
-{
-	__u32 load_len = msg->size;
-	if (load_len > MAX_DATA)
-		load_len = MAX_DATA;
-	if (load_len == 0)
-		return 0;
-	if (bpf_msg_pull_data(msg, 0, load_len, 0) < 0)
-		return 0;
-	if (bpf_probe_read_kernel(buf, load_len, (const void *)(long)msg->data) <
-	    0)
-		return 0;
-	return load_len;
-}
-
-// run frames one segment/message for the given capture direction. It performs a
-// single state lookup and loads bytes only when the current phase needs them.
+// run frames one segment/message for the given capture direction. observe loads
+// only the bytes the current phase needs.
 static __always_inline void run(void *ctx, struct bpf_sock *bsk, __u8 cap_dir,
 				struct conn_key *ckey, __u32 seg_len,
 				bool is_skb)
@@ -604,15 +643,7 @@ static __always_inline void run(void *ctx, struct bpf_sock *bsk, __u8 cap_dir,
 	if (!eb)
 		return;
 
-	__u32 loaded = 0;
-	if (st.phase == PH_HEADERS || st.phase == PH_DRAIN) {
-		if (is_skb)
-			loaded = load_skb((struct __sk_buff *)ctx, eb->data);
-		else
-			loaded = load_msg((struct sk_msg_md *)ctx, eb->data);
-	}
-
-	observe(ctx, bsk, cap_dir, &skey, &st, eb, loaded, seg_len);
+	observe(ctx, bsk, cap_dir, &skey, &st, eb, seg_len, is_skb);
 }
 
 SEC("sk_skb/stream_verdict")
