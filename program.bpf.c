@@ -45,6 +45,13 @@
 #include <gadget/types.h>
 #include <gadget/buffer.h>
 
+// Pull in the socket-enricher map and helpers. This lets the gadget resolve the
+// process (and therefore the container/pod) that owns each socket, and makes
+// Inspektor Gadget populate the enrichment map automatically.
+#define GADGET_TYPE_TRACING
+#include <gadget/sockets-map.h>
+#include <gadget/filter.h>
+
 #define AF_INET 2
 #define AF_INET6 10
 #define IPPROTO_TCP 6
@@ -85,6 +92,8 @@ struct http_event {
 	gadget_timestamp timestamp_raw;
 	struct gadget_l4endpoint_t src;
 	struct gadget_l4endpoint_t dst;
+	gadget_netns_id netns_id;
+	struct gadget_process proc;
 	__u8 direction_raw;
 	__u8 pad[3];
 	__u32 hdr_len; // length of the header block within data
@@ -249,40 +258,58 @@ static __always_inline __u32 parse_uint_at(const __u8 *buf, __u32 pos, __u32 len
 	return val;
 }
 
-static __always_inline void fill_endpoints(struct __sk_buff *skb,
-					   struct http_event *ev)
+// fill_from_socket reads the connection tuple and network namespace from the
+// kernel socket and, using the socket-enricher map, the process that owns it.
+// For received data src is the remote peer (the socket's destination) and dst is
+// the local end (the socket's source). It returns true if the event should be
+// kept: false means the socket is unavailable or the owning container/process is
+// excluded by an active filter (--containername, --podname, --pid, --comm, ...).
+static __always_inline bool fill_from_socket(struct __sk_buff *skb,
+					     struct http_event *ev)
 {
+	struct bpf_sock *bsk = skb->sk;
+	if (!bsk)
+		return false;
+	struct sock *sk = (struct sock *)bpf_skc_to_tcp_sock(bsk);
+	if (!sk)
+		return false;
+
 	ev->src.proto_raw = IPPROTO_TCP;
 	ev->dst.proto_raw = IPPROTO_TCP;
 
-	struct bpf_sock *sk = skb->sk;
-	if (!sk)
-		return;
+	__u32 netns = BPF_CORE_READ(sk, __sk_common.skc_net.net, ns.inum);
+	ev->netns_id = netns;
 
-	// Read the tuple from the socket, like the other network gadgets do. For
-	// received data, src = the remote peer (socket's dst), dst = local (socket's
-	// src). bpf_sock ports have defined byte orders: src_port is host order,
-	// dst_port is network order.
-	ev->src.port = bpf_ntohs(sk->dst_port);
-	ev->dst.port = (__u16)sk->src_port;
+	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+	struct inet_sock *isk = (struct inet_sock *)sk;
 
-	if (sk->family == AF_INET6) {
+	if (family == AF_INET6) {
 		ev->src.version = 6;
 		ev->dst.version = 6;
-		ev->src.addr_raw.v6[0] = sk->dst_ip6[0];
-		ev->src.addr_raw.v6[1] = sk->dst_ip6[1];
-		ev->src.addr_raw.v6[2] = sk->dst_ip6[2];
-		ev->src.addr_raw.v6[3] = sk->dst_ip6[3];
-		ev->dst.addr_raw.v6[0] = sk->src_ip6[0];
-		ev->dst.addr_raw.v6[1] = sk->src_ip6[1];
-		ev->dst.addr_raw.v6[2] = sk->src_ip6[2];
-		ev->dst.addr_raw.v6[3] = sk->src_ip6[3];
+		BPF_CORE_READ_INTO(&ev->src.addr_raw.v6, sk,
+				   __sk_common.skc_v6_daddr.in6_u.u6_addr32);
+		BPF_CORE_READ_INTO(&ev->dst.addr_raw.v6, sk,
+				   __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
 	} else {
 		ev->src.version = 4;
 		ev->dst.version = 4;
-		ev->src.addr_raw.v4 = sk->dst_ip4;
-		ev->dst.addr_raw.v4 = sk->src_ip4;
+		BPF_CORE_READ_INTO(&ev->src.addr_raw.v4, sk,
+				   __sk_common.skc_daddr);
+		BPF_CORE_READ_INTO(&ev->dst.addr_raw.v4, sk,
+				   __sk_common.skc_rcv_saddr);
 	}
+
+	__u16 dport = 0, sport = 0;
+	BPF_CORE_READ_INTO(&dport, sk, __sk_common.skc_dport);
+	ev->src.port = bpf_ntohs(dport); // remote peer
+	BPF_CORE_READ_INTO(&sport, isk, inet_sport);
+	ev->dst.port = bpf_ntohs(sport); // local
+
+	// Enrich with the owning process/container via the socket enricher, and
+	// apply the container/process filters against that owner.
+	struct gadget_socket_value *sv = gadget_socket_lookup(sk, netns);
+	gadget_process_populate_from_socket(sv, &ev->proc);
+	return !gadget_should_discard_data_by_skb(sv);
 }
 
 static __always_inline void build_key(struct __sk_buff *skb,
@@ -401,12 +428,15 @@ static __always_inline void handle_verdict(struct __sk_buff *skb)
 	struct http_event *ev = &eb->ev;
 	__builtin_memset(ev, 0, sizeof(*ev));
 	ev->timestamp_raw = bpf_ktime_get_boot_ns();
-	fill_endpoints(skb, ev);
 	ev->direction_raw = dir;
 	ev->hdr_len = hdr_end;
 	ev->data_len = data_len;
-	gadget_output_buf(skb, &events, eb,
-			  sizeof(struct http_event) + data_len);
+	// Fill endpoints, netns and the owning process, and drop the event if the
+	// connection's container/process is excluded by a filter. Framing (below)
+	// still runs so body bytes are skipped regardless.
+	if (fill_from_socket(skb, ev))
+		gadget_output_buf(skb, &events, eb,
+				  sizeof(struct http_event) + data_len);
 
 	// Decide how to treat the rest of the body so it isn't copied to user space.
 	if (has_cl) {

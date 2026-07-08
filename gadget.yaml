@@ -26,6 +26,10 @@ datasources:
       direction_raw:
         annotations:
           columns.hidden: "true"
+      netns_id:
+        annotations:
+          description: Network namespace of the connection's local endpoint
+          columns.hidden: "true"
       pad:
         annotations:
           columns.hidden: "true"

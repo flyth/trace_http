@@ -50,6 +50,7 @@ sleep 1
 echo "Starting ${IMAGE}..."
 "$IG" run "$IMAGE" \
 	--verify-image=false \
+	--host \
 	--fields direction,method,path,status_code,src,dst \
 	-o json --timeout 12 >"$OUT" 2>"$ERR" &
 IG_PID=$!

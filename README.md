@@ -25,9 +25,17 @@ For every HTTP/1.x message seen on a connection the gadget emits one event:
 | `body`           | the first bytes of the message body (up to 1024)                  |
 | `src`, `dst`     | source and destination L4 endpoints                               |
 
+Each event is also enriched with the process and container that owns the local
+end of the connection: `comm`, `pid`, `tid`, the mount and network namespaces,
+and — on Kubernetes or when using a container runtime — the container name,
+image and the pod/namespace/labels. This is the standard Inspektor Gadget
+process/container/Kubernetes enrichment.
+
 Requests and responses on the same connection share the connection's endpoints:
 for a request, `src` is the client and `dst` the server; for the matching
-response the two are swapped.
+response the two are swapped. The enrichment always reflects the **local**
+process that received the message (the server for a request, the client for a
+response).
 
 ## How it works
 
@@ -45,6 +53,10 @@ and skips the rest of the body, so the amount of data leaving the kernel stays
 proportional to the number of messages rather than to their size. A small
 WebAssembly module then turns the forwarded bytes into the structured fields
 above.
+
+The owning process and container are resolved through Inspektor Gadget's socket
+enricher, which maps each socket to the task that created it (and therefore to
+its container/pod).
 
 ## Requirements
 
@@ -67,19 +79,35 @@ Build the OCI image (uses the `ig` builder container):
 make build            # or: sudo ig image build -t trace_http:latest .
 ```
 
-Run it and generate some HTTP traffic in another terminal:
+Run it and generate some HTTP traffic in another terminal. On a plain host, pass
+`--host` so connections in the host network namespace are shown (without it, `ig`
+reports only traffic that belongs to a container):
 
 ```bash
-make run              # or: sudo ig run trace_http:latest
+make run              # or: sudo ig run trace_http:latest --host
 ```
 
 ```
-$ sudo ig run trace_http:latest
-DIRECTION   METHOD  PATH             HTTP  STATUS  HOST               SRC                DST
-request     GET     /                1.1   0       127.0.0.1:8080     127.0.0.1:44274    127.0.0.1:8080
-response                             1.1   200                        127.0.0.1:8080     127.0.0.1:44274
-request     GET     /api/users       1.1   0       127.0.0.1:8080     127.0.0.1:44274    127.0.0.1:8080
-response                             1.1   200                        127.0.0.1:8080     127.0.0.1:44274
+$ sudo ig run trace_http:latest --host
+DIRECTION   METHOD  PATH             HTTP  STATUS  HOST               SRC                DST                COMM     PID
+request     GET     /                1.1   0       127.0.0.1:8080     127.0.0.1:44274    127.0.0.1:8080     python3  1312
+response                             1.1   200                        127.0.0.1:8080     127.0.0.1:44274    curl     1373
+```
+
+### Filtering
+
+Restrict the output with the standard Inspektor Gadget filters, which are
+matched against the process/container that owns the local end of each
+connection:
+
+```bash
+# only a specific container / pod
+sudo ig run trace_http:latest --containername my-app
+kubectl gadget run trace_http:latest --podname web-0 --namespace prod
+
+# only a specific process
+sudo ig run trace_http:latest --host --comm curl
+sudo ig run trace_http:latest --host --pid 1234
 ```
 
 ### Selecting fields and output format
@@ -87,15 +115,16 @@ response                             1.1   200                        127.0.0.1:
 Use the standard `ig` flags, for example JSON output with a chosen set of fields:
 
 ```bash
-sudo ig run trace_http:latest \
-  --fields direction,method,path,status_code,host,src,dst \
+sudo ig run trace_http:latest --host \
+  --fields direction,method,path,status_code,host,src,dst,proc.comm,k8s.podName \
   -o json
 ```
 
 ### Running on Kubernetes
 
 Deploy Inspektor Gadget in the cluster and run the gadget with
-`kubectl gadget`:
+`kubectl gadget` (events are automatically enriched with the pod, namespace and
+container):
 
 ```bash
 kubectl gadget run ghcr.io/your-org/trace_http:latest

@@ -23,7 +23,7 @@ push:
 # attached to the cgroup-v2 root). Filter with the usual ig flags as needed.
 
 run:
-	sudo -E $(IG) run $(IMAGE_REF)
+	sudo -E $(IG) run $(IMAGE_REF) --host
 
 # --- test ---
 
