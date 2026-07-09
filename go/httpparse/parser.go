@@ -39,6 +39,7 @@ type Message struct {
 	HTTPVersion      string
 	StatusCode       uint16
 	Host             string
+	ContentType      string
 	ContentLength    uint32
 	HasContentLength bool
 	IsChunked        bool
@@ -84,6 +85,10 @@ func ParseMessage(data []byte, hdrLen int, directionRaw uint8) Message {
 		case equalFold(name, "host"):
 			if m.Host == "" {
 				m.Host = string(value)
+			}
+		case equalFold(name, "content-type"):
+			if m.ContentType == "" {
+				m.ContentType = string(bytes.TrimSpace(value))
 			}
 		case equalFold(name, "content-length"):
 			if n, err := strconv.ParseUint(string(bytes.TrimSpace(value)), 10, 32); err == nil {

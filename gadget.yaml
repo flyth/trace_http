@@ -4,43 +4,52 @@ homepageURL: https://inspektor-gadget.io/
 documentationURL: https://github.com/your-org/trace_http/blob/main/README.md
 sourceURL: https://github.com/your-org/trace_http
 params:
-  wasm:
-    idle-timeout-seconds:
-      key: idle-timeout-seconds
-      defaultValue: "10"
-      description: Emit a request-only row for an exchange whose response was not seen within this many seconds
-      title: Idle timeout
-    max-pending:
-      key: max-pending
-      defaultValue: "16384"
-      description: Maximum number of in-flight requests held while awaiting their response
-      title: Max pending exchanges
+  ebpf:
+    req_body:
+      key: req-body
+      defaultValue: "false"
+      description: Capture a sample of each request body (adds a per-message copy)
+      title: Capture request body
+    res_body:
+      key: res-body
+      defaultValue: "false"
+      description: Capture a sample of each response body (adds a per-message copy)
+      title: Capture response body
+    req_body_len:
+      key: req-body-len
+      defaultValue: "1024"
+      description: Maximum request body bytes to capture when --req-body is set (max 1024)
+      title: Request body sample length
+    res_body_len:
+      key: res-body-len
+      defaultValue: "1024"
+      description: Maximum response body bytes to capture when --res-body is set (max 1024)
+      title: Response body sample length
 datasources:
-  # Internal per-message stream produced by the eBPF program. It is not shown;
-  # the WASM module consumes it and emits the correlated "http" datasource.
-  http_msg:
+  # One event per request/response exchange. The eBPF program correlates the two
+  # in the kernel and appends both raw header blocks (request then response) as
+  # "data"; the WASM module parses method/path/host/status from them in place.
+  http:
     annotations:
-      # The raw "data" payload (headers + bounded body preview) is appended
-      # after the fixed event by the eBPF program; "data_len" gives its length.
       ebpf.rest.name: data
       ebpf.rest.len: data_len
-  # User-facing datasource: one event per request/response exchange.
-  http:
     fields:
+      data:
+        annotations:
+          columns.hidden: "true"
+          json.skip: "true"
       timestamp_raw:
         annotations:
           description: Time the request started
           columns.hidden: "true"
       src:
         annotations:
+          template: l4endpoint
           description: Client (request sender) endpoint
-          columns.width: "22"
-          columns.alignment: left
       dst:
         annotations:
+          template: l4endpoint
           description: Server (request receiver) endpoint
-          columns.width: "22"
-          columns.alignment: left
       method:
         annotations:
           description: HTTP request method
@@ -64,6 +73,11 @@ datasources:
         annotations:
           description: HTTP response status code (0 if no response was captured)
           columns.width: "6"
+      content_type:
+        annotations:
+          description: Value of the Content-Type header (response, else request)
+          columns.width: "20"
+          columns.alignment: left
       request_size:
         annotations:
           description: Total request size in bytes (headers + body)
@@ -80,20 +94,6 @@ datasources:
         annotations:
           description: Time from request start to the last response byte, in nanoseconds (0 if unknown)
           columns.width: "12"
-      comm:
-        annotations:
-          description: Command of the process that owns the connection
-          columns.width: "16"
-          columns.alignment: left
-      pid:
-        annotations:
-          description: PID of the process that owns the connection
-          columns.hidden: "true"
-      mntns_id:
-        annotations:
-          description: Mount namespace of the owning process. Internal use only.
-          columns.hidden: "true"
-          json.skip: "true"
       is_chunked:
         annotations:
           description: Whether the response used chunked transfer-encoding
@@ -118,3 +118,32 @@ datasources:
           columns.width: "32"
           columns.alignment: left
           columns.hidden: "true"
+      # Internal framing/length fields carried for the WASM parser.
+      req_hdr_len:
+        annotations:
+          columns.hidden: "true"
+          json.skip: "true"
+      req_data_len:
+        annotations:
+          columns.hidden: "true"
+          json.skip: "true"
+      resp_hdr_len:
+        annotations:
+          columns.hidden: "true"
+          json.skip: "true"
+      resp_data_len:
+        annotations:
+          columns.hidden: "true"
+          json.skip: "true"
+      data_len:
+        annotations:
+          columns.hidden: "true"
+          json.skip: "true"
+      pad:
+        annotations:
+          columns.hidden: "true"
+          json.skip: "true"
+      netns_id:
+        annotations:
+          columns.hidden: "true"
+          json.skip: "true"

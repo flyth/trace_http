@@ -18,6 +18,7 @@ and emits a single event:
 | `path`             | request target                                                    |
 | `http_version`     | protocol version, e.g. `1.1`                                      |
 | `status_code`      | response status code (`0` if no response was captured)           |
+| `content_type`     | value of the `Content-Type` header (response, else request)      |
 | `host`             | value of the request `Host` header                               |
 | `request_size`     | total request size in bytes (headers + body)                     |
 | `response_size`    | total response size in bytes (headers + body), `0` if unknown    |
@@ -48,11 +49,11 @@ The gadget attaches three small eBPF programs:
 Observing both the sent and received sides lets the gadget capture both ends of a
 connection, including connections where only one endpoint is on the node. When
 both endpoints are on the node the message is captured exactly once (no
-duplicates). The eBPF programs forward each message's headers and a short body
-preview to user space and skip the rest of the body, so the amount of data
-leaving the kernel stays proportional to the number of messages rather than to
-their size. A WebAssembly module then parses the forwarded bytes, pairs each
-request with its response, and computes the sizes and latency.
+duplicates). The eBPF programs frame each message, **pair each request with its
+response in the kernel**, and compute the sizes and latency, emitting a single
+event per exchange with the two header blocks and a short body preview. A small
+WebAssembly module then only parses those header blocks to fill in
+method/path/host/status; it performs no correlation.
 
 The owning process and container are resolved through Inspektor Gadget's socket
 enricher, which maps each socket to the task that created it (and therefore to
@@ -97,10 +98,21 @@ SRC                DST                COMM     METHOD  PATH        HTTP  STATUS 
 
 ### Options
 
-| Flag                     | Default | Description                                                             |
-| ------------------------ | ------- | ---------------------------------------------------------------------- |
-| `--idle-timeout-seconds` | `10`    | Emit a request-only row if its response is not seen within this time.  |
-| `--max-pending`          | `16384` | Maximum number of in-flight requests held while awaiting a response.   |
+By default only request/response **metadata** (method, path, status, sizes,
+latency) is captured. Copying a body sample costs a per-message copy and widens
+each event, so it is opt-in per direction:
+
+| Flag             | Default | Description                                                          |
+| ---------------- | ------- | -------------------------------------------------------------------- |
+| `--req-body`     | `false` | Capture a sample of each request body.                               |
+| `--res-body`     | `false` | Capture a sample of each response body.                              |
+| `--req-body-len` | `1024`  | Max request body bytes to capture (when `--req-body`; capped at 1024). |
+| `--res-body-len` | `1024`  | Max response body bytes to capture (when `--res-body`; capped at 1024). |
+
+A body sample is captured from the first segment that carries body bytes (the
+header segment or, if the body is delivered separately, the first body segment),
+up to the configured length. `request_body`/`response_body` are empty unless the
+matching flag is set.
 
 ### Filtering
 
@@ -143,10 +155,11 @@ kubectl gadget run ghcr.io/your-org/trace_http:latest
   (they still flow normally).
 - One event is emitted **per request/response exchange**, when the response
   completes. A request that never receives a response is reported on its own
-  (with `status_code` `0`) once the connection closes or the idle timeout
-  elapses.
-- `request_body`/`response_body` hold a preview of up to 1024 bytes, populated
-  when the body is sent together with the headers.
+  (with `status_code` `0`) once the connection closes.
+- `request_body`/`response_body` hold a preview of the body (up to
+  `--req-body-len`/`--res-body-len` bytes, default 1024), captured from the first
+  segment that carries body bytes when the matching `--req-body`/`--res-body`
+  flag is set. They are empty by default.
 - `latency_total_ns` and `response_size` are known for responses framed by a
   `Content-Length` or chunked transfer-encoding. For a response whose body ends
   only when the connection closes, only `latency_ttfb_ns` is reported.
@@ -155,7 +168,8 @@ kubectl gadget run ghcr.io/your-org/trace_http:latest
 
 ## Development
 
-Unit-test the userspace parser and correlation logic (no root or kernel required):
+Unit-test the userspace HTTP parser (and the reference correlation logic that the
+in-kernel pairing mirrors), no root or kernel required:
 
 ```bash
 make unit             # cd go && go test ./...
