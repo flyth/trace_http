@@ -147,6 +147,10 @@ func onEvent(source api.DataSource, data api.Data) {
 		outChunked.SetBool(data, resp.IsChunked)
 		outWebsocket.SetBool(data, resp.IsWebsocket)
 		respCType = resp.ContentType
+		// For an SSE push (is_sse) the response block is the original headers
+		// followed by the raw push bytes; ParseMessage parses the reused
+		// headers (status/content-type) and de-chunks the body just like any
+		// other response, so no special handling is needed here.
 		if len(resp.Body) > 0 {
 			outRespBody.SetBytes(data, resp.Body)
 		}

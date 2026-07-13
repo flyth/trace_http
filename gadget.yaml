@@ -25,6 +25,11 @@ params:
       defaultValue: "1024"
       description: Maximum response body bytes to capture when --res-body is set (max 1024)
       title: Response body sample length
+    sse:
+      key: sse
+      defaultValue: "false"
+      description: For text/event-stream responses, emit one event per Server-Sent Event record (reusing the request fields, with per-record size/timing and the record as the response body)
+      title: Split Server-Sent Events
 datasources:
   # One event per request/response exchange. The eBPF program correlates the two
   # in the kernel and appends both raw header blocks (request then response) as
@@ -105,6 +110,10 @@ datasources:
       complete:
         annotations:
           description: Whether both request and full response were captured
+          columns.hidden: "true"
+      is_sse:
+        annotations:
+          description: Whether this row is one Server-Sent Events push (--sse)
           columns.hidden: "true"
       request_body:
         annotations:
