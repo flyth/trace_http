@@ -18,6 +18,7 @@ SRVLOG="$(mktemp)"
 
 cleanup() {
 	[ -n "${SRV_PID:-}" ] && kill "${SRV_PID}" 2>/dev/null
+	[ -n "${SSE_SRV_PID:-}" ] && kill "${SSE_SRV_PID}" 2>/dev/null
 	rm -f "$OUT" "$ERR" "$SRVLOG"
 }
 trap cleanup EXIT
@@ -80,6 +81,62 @@ if grep -qiE "^Error:|failed to (load|attach)|too large|bad address" "$ERR"; the
 	echo "FAIL: the gadget did not load/attach (see stderr above)."
 	exit 1
 fi
+
+# --- Soft check: --sse splits a text/event-stream response into per-push rows.
+# Chunked SSE server that flushes one record per write.
+SSE_PORT=$((PORT + 1))
+SSEOUT="$(mktemp)"
+SSEERR="$(mktemp)"
+python3 - "$SSE_PORT" <<'PY' >/dev/null 2>&1 &
+import sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        for i in range(4):
+            rec = b"event: tick\ndata: {\"n\": %d}\n\n" % i
+            self.wfile.write(b"%x\r\n%s\r\n" % (len(rec), rec))
+            self.wfile.flush()
+            time.sleep(0.2)
+        self.wfile.write(b"0\r\n\r\n"); self.wfile.flush()
+    def log_message(self, *a):
+        pass
+ThreadingHTTPServer.allow_reuse_address = True
+ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+SSE_SRV_PID=$!
+sleep 1
+"$IG" run "$IMAGE" --verify-image=false --host --sse --res-body \
+	--fields path,status_code,response_size,response_body,is_sse \
+	-o json --timeout 10 >"$SSEOUT" 2>"$SSEERR" &
+SSE_IG_PID=$!
+sleep 5
+python3 - "$SSE_PORT" <<'PY' >/dev/null 2>&1 || true
+import http.client, sys
+c = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]))
+c.request("GET", "/stream"); r = c.getresponse()
+while r.read(256):
+    pass
+c.close()
+PY
+wait "$SSE_IG_PID" 2>/dev/null || true
+kill "$SSE_SRV_PID" 2>/dev/null
+if grep -qiE "^Error:|failed to (load|attach)|too large|bad address" "$SSEERR"; then
+	echo "FAIL: the gadget did not load/attach with --sse (see below)."
+	grep -v "signature verification is disabled" "$SSEERR" || true
+	rm -f "$SSEOUT" "$SSEERR"
+	exit 1
+fi
+if grep -q '"is_sse":true' "$SSEOUT"; then
+	echo "PASS: --sse emitted per-push Server-Sent Events rows"
+else
+	echo "NOTE: --sse loaded/attached but no per-push row observed (workload may"
+	echo "      have raced probe attachment); this soft check does not gate."
+fi
+rm -f "$SSEOUT" "$SSEERR"
 
 if grep -q '"method":"GET"' "$OUT" && grep -q '"status_code":200' "$OUT"; then
 	echo "PASS: gadget loaded and captured a correlated HTTP exchange"

@@ -108,11 +108,41 @@ each event, so it is opt-in per direction:
 | `--res-body`     | `false` | Capture a sample of each response body.                              |
 | `--req-body-len` | `1024`  | Max request body bytes to capture (when `--req-body`; capped at 1024). |
 | `--res-body-len` | `1024`  | Max response body bytes to capture (when `--res-body`; capped at 1024). |
+| `--sse`          | `false` | For `text/event-stream` responses, emit one event per server push.   |
 
 A body sample is captured from the first segment that carries body bytes (the
 header segment or, if the body is delivered separately, the first body segment),
 up to the configured length. `request_body`/`response_body` are empty unless the
 matching flag is set.
+
+### Server-Sent Events (`--sse`)
+
+By default a streaming `text/event-stream` response is reported as a single
+exchange (status and headers, with an unknown size) and its body is not
+inspected. With `--sse`, once a response is detected as `text/event-stream` the
+gadget emits that one "response headers" row and then **one additional event per
+server push** — i.e. per `write`/`flush` the server makes on the stream. This is
+aimed at observing streamed APIs such as LLM token streams.
+
+Each per-push event reuses the request side of the exchange (`method`, `path`,
+`host`, `src`, `dst`, and the process/container/pod enrichment) and fills the
+response fields from that push:
+
+- `response_size` is the byte count of the push,
+- `latency_ttfb_ns`/`latency_total_ns` are the time from the request start to the
+  push,
+- `response_body` holds the push's bytes (de-chunked if the stream is chunked),
+  up to `--res-body-len`, when `--res-body` is set,
+- `is_sse` marks the per-push rows (hidden column; available via `--fields`/JSON).
+
+No new visible columns are added for non-SSE traffic. Both plain (connection-close)
+and chunked `text/event-stream` responses are supported.
+
+> One event is emitted per server **push** (TCP write/flush), not strictly per SSE
+> `event:` record. For typical streaming — where the server flushes one record at a
+> time — the two coincide. A push that batches several records shows them together
+> in one `response_body`; a record split across writes is shown in pieces. Only the
+> first `--res-body-len` bytes of each push are sampled.
 
 ### Filtering
 
@@ -165,6 +195,9 @@ kubectl gadget run ghcr.io/your-org/trace_http:latest
   only when the connection closes, only `latency_ttfb_ns` is reported.
 - A **WebSocket** upgrade is reported (`is_websocket`), after which the connection
   carries WebSocket frames and is no longer parsed as HTTP.
+- With `--sse`, a `text/event-stream` response additionally emits **one event per
+  server push** (`is_sse`), reusing the request side with the push's size, timing
+  and body preview. See [Server-Sent Events](#server-sent-events---sse).
 
 ## Development
 

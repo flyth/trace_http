@@ -83,6 +83,13 @@ GADGET_PARAM(res_body);
 GADGET_PARAM(req_body_len);
 GADGET_PARAM(res_body_len);
 
+// When set, a text/event-stream response is not just reported once and passed
+// through: each Server-Sent Event record it carries is emitted as its own event
+// (reusing the request side, with per-record size/timing and the record bytes as
+// the response body preview). Off by default; unrelated traffic is unaffected.
+const volatile bool sse = false;
+GADGET_PARAM(sse);
+
 // HTTP message direction, derived from the start line.
 #define HTTP_DIR_UNKNOWN 0
 #define HTTP_DIR_REQUEST 1
@@ -98,6 +105,7 @@ enum http_phase : __u8 {
 	PH_SKIP = 1, // skipping skip_remaining Content-Length body bytes
 	PH_DRAIN = 2, // draining a chunked body until its terminator
 	PH_PASS = 3, // pass the rest of the connection through untouched
+	PH_SSE = 4, // splitting a text/event-stream response into per-record events
 };
 
 // conn_key identifies a socket by its 4-tuple. It is built byte-identically by
@@ -154,7 +162,7 @@ struct parse_state {
 	enum http_phase phase;
 	__u8 cur_dir; // HTTP direction of the in-progress message
 	__u8 tail[4]; // trailing bytes carried across segments for the chunked terminator
-	__u8 pad2;
+	__u8 sse_chunked; // in PH_SSE: whether the event-stream body is chunked-framed
 	__u32 skip_remaining; // Content-Length body bytes left to skip
 	__u32 total_body; // body bytes counted for the in-progress message
 	__u32 cur_hdr_len; // header length of the in-progress message
@@ -185,7 +193,8 @@ struct combined_event {
 	__u64 latency_ttfb_ns; // request start -> first response byte
 	__u64 latency_total_ns; // request start -> last response byte, 0 if unknown
 	__u8 complete; // both request and full response captured
-	__u8 pad[7];
+	__u8 is_sse; // internal: response block is one SSE record, not an HTTP response
+	__u8 pad[6];
 };
 
 // event_buf is the per-CPU scratch holding the combined event and its appended
@@ -217,6 +226,15 @@ struct pending {
 	struct gadget_process proc; // request/client owning process
 	__u8 req_data[REQ_PREVIEW];
 	__u8 resp_data[RESP_PREVIEW];
+
+	// Per-push SSE state, used while the phase is PH_SSE. Only meaningful for
+	// text/event-stream responses when --sse is set; dormant (costing only its
+	// bytes) for every other exchange.
+	__u64 sse_push_ts; // timestamp of the current push
+	__u32 sse_prev_len; // body-preview bytes captured for the current push
+	__u8 sse_active; // an in-progress SSE split (on close: drop, don't re-emit)
+	__u8 sse_pad[3];
+	__u8 sse_prev[PREVIEW]; // current push's body preview
 };
 
 struct {
@@ -325,6 +343,8 @@ struct hscan {
 	int cl_pos; // index just past a Content-Length "gth:" tail, -1 if none
 	__u8 b1, b2, b3; // lowercased bytes at i-1, i-2, i-3
 	__u8 chunked;
+	__u8 es; // characters of "event-stream" matched so far
+	__u8 es_found; // saw the full "event-stream" token (text/event-stream)
 };
 
 static long hscan_cb(__u32 i, void *ctx)
@@ -341,20 +361,39 @@ static long hscan_cb(__u32 i, void *ctx)
 		s->cl_pos = (int)(i + 1); // "...gth:" (Content-Length)
 	if (lc == 'd' && s->b1 == 'e' && s->b2 == 'k' && s->b3 == 'n')
 		s->chunked = 1; // "...nked" (chunked)
+	// Progress match of the text/event-stream Content-Type. Naive reset (not
+	// full KMP): fine for a real header value, which never overlaps this
+	// literal pathologically. The es < len guard keeps the index in range.
+	static const char es_pat[] = "event-stream";
+	if (s->es < sizeof(es_pat) - 1 && lc == (__u8)es_pat[s->es]) {
+		s->es++;
+		if (s->es == sizeof(es_pat) - 1)
+			s->es_found = 1;
+	} else {
+		s->es = (lc == (__u8)es_pat[0]) ? 1 : 0;
+	}
 	s->b3 = s->b2;
 	s->b2 = s->b1;
 	s->b1 = lc;
 	return 0;
 }
 
-// scan_headers finds the header-block length, the Content-Length value position
-// and the chunked flag in a single pass. Matching only the 4-byte tails of the
-// header names can in theory collide with a header value ending in "gth:" or
-// "nked"; this is vanishingly rare and a Content-Length match is confirmed by
-// parsing digits after it.
+// hdrinfo bundles what scan_headers extracts (a BPF-to-BPF call caps at 5 args,
+// so the several outputs travel through one pointer).
+struct hdrinfo {
+	__u32 hdr_end; // index past the CRLFCRLF header terminator, 0 if none
+	int cl_pos; // index just past a Content-Length "gth:" tail, -1 if none
+	bool chunked;
+	bool event_stream; // Content-Type advertises text/event-stream
+};
+
+// scan_headers finds the header-block length, the Content-Length value position,
+// the chunked flag and whether the body is text/event-stream in a single pass.
+// Matching only the 4-byte tails of the header names can in theory collide with a
+// header value ending in "gth:" or "nked"; this is vanishingly rare and a
+// Content-Length match is confirmed by parsing digits after it.
 static __noinline void scan_headers(const __u8 *buf, __u32 len,
-					 __u32 *hdr_end, int *cl_pos,
-					 bool *chunked)
+				    struct hdrinfo *out)
 {
 	struct hscan s = {};
 	s.buf = buf;
@@ -362,9 +401,10 @@ static __noinline void scan_headers(const __u8 *buf, __u32 len,
 	s.cl_pos = -1;
 	// Variable count so the verifier does not inline the loop.
 	bpf_loop(len, hscan_cb, &s, 0);
-	*hdr_end = s.hdr_end;
-	*cl_pos = s.cl_pos;
-	*chunked = s.chunked != 0;
+	out->hdr_end = s.hdr_end;
+	out->cl_pos = s.cl_pos;
+	out->chunked = s.chunked != 0;
+	out->event_stream = s.es_found != 0;
 }
 
 // tscan looks for the chunked terminator "0\r\n\r\n", carrying the last four
@@ -633,9 +673,13 @@ static __always_inline void copy_bounded(void *dst, const void *src, __u32 len,
 // on the http datasource: fixed header (attributed to the request/client side)
 // followed by the request block then the response block. full=false means the
 // response end is unknown (connection-close response or an unpaired request).
-static __always_inline void emit_combined(void *ctx, struct event_buf *eb,
-					  struct pending *p, bool full,
-					  __u32 resp_size, __u64 ts_last)
+//
+// It is __noinline and ctx-free: on this gadget's kernel floor (5.17+, so
+// ring-buffer output is always present) gadget_output_buf ignores ctx, so a
+// single shared copy can be called from every program instead of inlining this
+// (large) assembly into each of them, which keeps verifier complexity down.
+static __noinline void emit_combined(struct event_buf *eb, struct pending *p,
+				     bool full, __u32 resp_size, __u64 ts_last)
 {
 	struct combined_event *ev = &eb->ev;
 	__builtin_memset(ev, 0, sizeof(*ev));
@@ -665,21 +709,80 @@ static __always_inline void emit_combined(void *ctx, struct event_buf *eb,
 	// rp <= RESP_PREVIEW keep the writes within eb->data (COMBINED_DATA).
 	copy_bounded(eb->data, p->req_data, rq, REQ_PREVIEW);
 	copy_bounded(eb->data + rq, p->resp_data, rp, RESP_PREVIEW);
-	gadget_output_buf(ctx, &events, eb,
+	gadget_output_buf(NULL, &events, eb,
 			  sizeof(struct combined_event) + rq + rp);
 }
 
 // finalize emits the exchange for pk and drops it. full=false for a
 // connection-close response or an unpaired request (end/size unknown).
-static __always_inline void finalize(void *ctx, struct event_buf *eb,
+static __always_inline void finalize(struct event_buf *eb,
 				     struct pending_key *pk, bool full,
 				     __u32 resp_size, __u64 ts_last)
 {
 	struct pending *p = bpf_map_lookup_elem(&http_pending, pk);
 	if (!p)
 		return;
-	emit_combined(ctx, eb, p, full, resp_size, ts_last);
+	emit_combined(eb, p, full, resp_size, ts_last);
 	bpf_map_delete_elem(&http_pending, pk);
+}
+
+// emit_only emits the exchange for pk but keeps the pending entry, used for the
+// one-off "response headers seen" row of an SSE stream whose pending is then kept
+// alive to attribute each following per-record event.
+static __always_inline void emit_only(struct event_buf *eb,
+				      struct pending_key *pk, bool full,
+				      __u32 resp_size, __u64 ts_last)
+{
+	struct pending *p = bpf_map_lookup_elem(&http_pending, pk);
+	if (!p)
+		return;
+	emit_combined(eb, p, full, resp_size, ts_last);
+}
+
+// emit_sse_push emits one Server-Sent-Events push as its own event. It reuses
+// the pending entry's request side and the *original* response headers (so
+// method/path/host and status/content-type parse exactly as for the stream),
+// and appends this push's body bytes as the response body preview. prev_len bytes
+// of p->sse_prev hold that preview; push_size is the push's byte count. The push
+// time is read from p->sse_push_ts. __noinline and ctx-free for the same reason
+// as emit_combined (a BPF-to-BPF call also caps at 5 args).
+static __noinline void emit_sse_push(struct event_buf *eb, struct pending *p,
+				     __u32 prev_len, __u32 push_size)
+{
+	struct combined_event *ev = &eb->ev;
+	__builtin_memset(ev, 0, sizeof(*ev));
+
+	ev->timestamp_raw = p->req_seen ? p->req_ts : p->resp_first_ts;
+	ev->src = p->src;
+	ev->dst = p->dst;
+	ev->netns_id = p->netns;
+	ev->proc = p->proc;
+	ev->req_hdr_len = p->req_hdr_len;
+	ev->req_data_len = p->req_data_len;
+	ev->resp_hdr_len = p->resp_hdr_len;
+	ev->request_size = p->req_size;
+	ev->response_size = push_size;
+	if (p->req_seen) {
+		ev->latency_ttfb_ns = p->sse_push_ts - p->req_ts;
+		ev->latency_total_ns = p->sse_push_ts - p->req_ts;
+	}
+	ev->complete = 1;
+	ev->is_sse = 1;
+
+	__u32 rq = clamp_len(p->req_data_len, REQ_PREVIEW);
+	// Response block = original response headers, then the push as its body.
+	// The header length is bounded by MAX_SCAN (that is where scan_headers stops)
+	// and the preview by PREVIEW, so rq + rh + pv <= REQ_PREVIEW + MAX_DATA fits
+	// eb->data (COMBINED_DATA) and the verifier can prove each write is in range.
+	__u32 rh = clamp_len(p->resp_hdr_len, MAX_SCAN);
+	__u32 pv = clamp_len(prev_len, PREVIEW);
+	ev->resp_data_len = rh + pv;
+	ev->data_len = rq + rh + pv;
+	copy_bounded(eb->data, p->req_data, rq, REQ_PREVIEW);
+	copy_bounded(eb->data + rq, p->resp_data, rh, MAX_SCAN);
+	copy_bounded(eb->data + rq + rh, p->sse_prev, pv, PREVIEW);
+	gadget_output_buf(NULL, &events, eb,
+			  sizeof(struct combined_event) + rq + rh + pv);
 }
 
 // pending_get_or_create returns the pending entry for pk, inserting a zeroed one
@@ -701,7 +804,7 @@ static __always_inline struct pending *pending_get_or_create(struct pending_key 
 // total request size on the pending entry; for a response it finalizes and emits
 // the exchange (this is the response-completion hook where a later phase will
 // also increment aggregated metrics).
-static __always_inline void on_msg_complete(void *ctx, struct event_buf *eb,
+static __always_inline void on_msg_complete(struct event_buf *eb,
 					    struct parse_state *st)
 {
 	struct pending_key pk = { .canon = st->cur_canon, .seq = st->cur_seq };
@@ -712,7 +815,7 @@ static __always_inline void on_msg_complete(void *ctx, struct event_buf *eb,
 			p->req_size = total;
 		return;
 	}
-	finalize(ctx, eb, &pk, true, total, bpf_ktime_get_boot_ns());
+	finalize(eb, &pk, true, total, bpf_ktime_get_boot_ns());
 }
 
 // load_skb loads up to `len` bytes of a received segment at offset `off` into buf.
@@ -891,6 +994,74 @@ static __always_inline void capture_body(void *ctx, bool is_skb,
 	}
 }
 
+// sse_emit_segment forwards one SSE push (one segment's body bytes) as its own
+// event, reusing the pending entry's request side and response headers. It does
+// no in-kernel record scanning or de-chunking: the raw push bytes are shipped and
+// the WASM module parses/de-chunks them (via ParseMessage) exactly like any other
+// response body. For a chunked stream it also watches for the 0-length-chunk
+// terminator to end the split cleanly (so a kept-alive connection reframes the
+// next HTTP message). Only the first PREVIEW bytes of a push are sampled.
+// ponytail: one event per server push (write/flush), not strictly per SSE record;
+// for typical streaming (one record flushed at a time) they coincide. A push that
+// batches several records shows them together; a record split across writes shows
+// in pieces.
+static __always_inline void sse_emit_segment(void *ctx, bool is_skb,
+					     struct parse_state *st,
+					     struct event_buf *eb, __u32 seg_len)
+{
+	struct pending_key pk = { .canon = st->cur_canon, .seq = st->cur_seq };
+	struct pending *p = bpf_map_lookup_elem(&http_pending, &pk);
+	if (!p) {
+		st->phase = PH_PASS; // evicted / filtered: stop attributing
+		return;
+	}
+
+	// Sample up to res_body_len push bytes straight into the preview buffer.
+	__u32 maxprev = res_body ? res_body_len : 0;
+	if (maxprev > PREVIEW)
+		maxprev = PREVIEW;
+	__u32 n = 0;
+	if (maxprev) {
+		n = seg_len < maxprev ? seg_len : maxprev;
+		n = load_at(ctx, is_skb, p->sse_prev, 0, n);
+		if (n > PREVIEW)
+			n = PREVIEW;
+	}
+	p->sse_prev_len = n;
+	p->sse_push_ts = bpf_ktime_get_boot_ns();
+	emit_sse_push(eb, p, n, seg_len);
+
+	// For chunked event-streams, the 0-length chunk terminates the response.
+	if (st->sse_chunked &&
+	    drain_load_scan(ctx, is_skb, eb, seg_len, st->tail)) {
+		bpf_map_delete_elem(&http_pending, &pk);
+		st->phase = PH_HEADERS; // kept-alive: the next message reframes
+	}
+}
+
+// sse_begin turns a just-seen text/event-stream response into a per-push split:
+// it emits the one-off "response headers" row (keeping the pending entry alive to
+// attribute the pushes) and enters PH_SSE. __noinline and ctx-free so this and the
+// emit it triggers are verified once and shared, not inlined into observe.
+static __noinline void sse_begin(struct parse_state *st, struct event_buf *eb,
+				 bool chunked)
+{
+	struct pending_key pk = { .canon = st->cur_canon, .seq = st->cur_seq };
+	struct pending *p = bpf_map_lookup_elem(&http_pending, &pk);
+	if (!p) {
+		st->phase = PH_PASS; // response side filtered out / evicted
+		return;
+	}
+	p->sse_active = 1;
+	p->sse_prev_len = 0;
+	p->sse_push_ts = 0;
+
+	emit_only(eb, &pk, false, 0, 0);
+	st->sse_chunked = chunked ? 1 : 0;
+	st->tail[0] = st->tail[1] = st->tail[2] = st->tail[3] = 0;
+	st->phase = PH_SSE;
+}
+
 // observe runs the per-stream framing state machine, loading only the bytes the
 // current phase needs. seg_len is the full segment/message length; is_skb selects
 // the load helper. It updates and writes back st.
@@ -910,7 +1081,7 @@ static __always_inline void observe(void *ctx, struct bpf_sock *bsk,				    __u8
 			st->total_body += st->skip_remaining;
 			st->skip_remaining = 0;
 			st->phase = PH_HEADERS;
-			on_msg_complete(ctx, eb, st);
+			on_msg_complete(eb, st);
 		}
 		return;
 	}
@@ -921,8 +1092,13 @@ static __always_inline void observe(void *ctx, struct bpf_sock *bsk,				    __u8
 		st->total_body += seg_len;
 		if (done) {
 			st->phase = PH_HEADERS;
-			on_msg_complete(ctx, eb, st);
+			on_msg_complete(eb, st);
 		}
+		return;
+	}
+
+	if (st->phase == PH_SSE) {
+		sse_emit_segment(ctx, is_skb, st, eb, seg_len);
 		return;
 	}
 
@@ -936,10 +1112,12 @@ static __always_inline void observe(void *ctx, struct bpf_sock *bsk,				    __u8
 		return; // not a recognisable message start; leave state untouched
 
 	__u32 scan = loaded > MAX_SCAN ? MAX_SCAN : loaded;
-	__u32 hdr_end = 0;
-	int cl_pos = -1;
-	bool is_chunked = false;
-	scan_headers(eb->data, scan, &hdr_end, &cl_pos, &is_chunked);
+	struct hdrinfo hi = { .cl_pos = -1 };
+	scan_headers(eb->data, scan, &hi);
+	__u32 hdr_end = hi.hdr_end;
+	int cl_pos = hi.cl_pos;
+	bool is_chunked = hi.chunked;
+	bool is_event_stream = hi.event_stream;
 	if (hdr_end == 0)
 		return; // headers not complete within this segment (ceiling)
 
@@ -979,6 +1157,12 @@ static __always_inline void observe(void *ctx, struct bpf_sock *bsk,				    __u8
 	// also computes and stashes the canonical connection key on st.
 	store_message(bsk, skey, st, eb, data_len);
 
+	// Detect a text/event-stream response we should split per record (opt-in).
+	// SSE never carries a Content-Length, so this only competes with the
+	// chunked and connection-close response branches below.
+	bool is_es = sse && dir == HTTP_DIR_RESPONSE && !has_cl &&
+		     is_event_stream;
+
 	// Decide how to treat the rest of the body.
 	if (has_cl) {
 		if (content_length > body_in_seg) {
@@ -987,8 +1171,14 @@ static __always_inline void observe(void *ctx, struct bpf_sock *bsk,				    __u8
 		} else {
 			st->total_body = content_length;
 			st->phase = PH_HEADERS;
-			on_msg_complete(ctx, eb, st);
+			on_msg_complete(eb, st);
 		}
+	} else if (is_es) {
+		// Emit the headers row once and enter PH_SSE; each following server
+		// push (segment) is then forwarded as its own event. ponytail: a
+		// push arriving in the very same TCP write as the response headers
+		// is not split out — real SSE servers flush the headers first.
+		sse_begin(st, eb, is_chunked);
 	} else if (is_chunked && dir == HTTP_DIR_RESPONSE) {
 		// The chunked body (and its terminator) may already be in this
 		// segment. Scan the segment tail before waiting for more: a
@@ -996,7 +1186,7 @@ static __always_inline void observe(void *ctx, struct bpf_sock *bsk,				    __u8
 		st->phase = PH_DRAIN;
 		if (drain_load_scan(ctx, is_skb, eb, seg_len, st->tail)) {
 			st->phase = PH_HEADERS;
-			on_msg_complete(ctx, eb, st);
+			on_msg_complete(eb, st);
 		}
 	} else if (dir == HTTP_DIR_RESPONSE) {
 		// A response with neither Content-Length nor chunked ends only
@@ -1004,11 +1194,11 @@ static __always_inline void observe(void *ctx, struct bpf_sock *bsk,				    __u8
 		// unknown total/size, then pass the rest through.
 		struct pending_key pk = { .canon = st->cur_canon,
 					  .seq = st->cur_seq };
-		finalize(ctx, eb, &pk, false, 0, 0);
+		finalize(eb, &pk, false, 0, 0);
 		st->phase = PH_PASS;
 	} else {
 		st->phase = PH_HEADERS; // request without a body
-		on_msg_complete(ctx, eb, st);
+		on_msg_complete(eb, st);
 	}
 }
 
@@ -1094,7 +1284,6 @@ int http_msg(struct sk_msg_md *msg)
 
 // flush_ctx carries the state a close flush needs across the bounded loop.
 struct flush_ctx {
-	void *ctx;
 	struct event_buf *eb;
 	struct canon_key canon;
 	__u32 base;
@@ -1107,8 +1296,16 @@ static long flush_cb(__u32 i, void *c)
 	struct flush_ctx *fc = c;
 	struct pending_key pk = { .canon = fc->canon, .seq = fc->base + i };
 	struct pending *p = bpf_map_lookup_elem(&http_pending, &pk);
-	if (p && p->req_seen)
-		finalize(fc->ctx, fc->eb, &pk, false, 0, 0);
+	if (!p)
+		return 0;
+	if (p->sse_active) {
+		// An SSE split whose stream closed: its headers and pushes were
+		// already emitted. Just drop it, without a spurious request-only row.
+		bpf_map_delete_elem(&http_pending, &pk);
+		return 0;
+	}
+	if (p->req_seen)
+		finalize(fc->eb, &pk, false, 0, 0);
 	return 0;
 }
 
@@ -1143,8 +1340,7 @@ static __always_inline void close_flush(struct bpf_sock *bsk,
 		if (eb) {
 			__u32 window =
 				next > FLUSH_WINDOW ? FLUSH_WINDOW : next;
-			struct flush_ctx fc = { .ctx = bsk,
-						.eb = eb,
+			struct flush_ctx fc = { .eb = eb,
 						.canon = canon,
 						.base = next - window };
 			bpf_loop(window, flush_cb, &fc, 0);
