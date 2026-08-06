@@ -244,6 +244,9 @@ struct {
 	__type(value, __u32);
 } http_sockhash SEC(".maps");
 
+GADGET_SK_TARGET_MAP(http_verdict, http_sockhash);
+GADGET_SK_TARGET_MAP(http_msg, http_sockhash);
+
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 65536);

@@ -17,7 +17,7 @@ concurrency:
 env:
   # Version of the ig CLI used to build the gadget. Bump to upgrade.
   # NOTE: this gadget needs sk_skb/sock_ops support in ig; pin a version that has it.
-  IG_VERSION: v0.53.2
+  IG_VERSION: v0.55.0
 
 jobs:
   build-and-push:
